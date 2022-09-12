@@ -10,9 +10,14 @@ import (
 	"unicode/utf8"
 )
 
+const (
+	helpName  = "help"
+	helpAlias = "h"
+)
+
 var helpCommand = &Command{
-	Name:      "help",
-	Aliases:   []string{"h"},
+	Name:      helpName,
+	Aliases:   []string{helpAlias},
 	Usage:     "Shows a list of commands or help for one command",
 	ArgsUsage: "[command]",
 	Action: func(cCtx *Context) error {
@@ -27,8 +32,8 @@ var helpCommand = &Command{
 }
 
 var helpSubcommand = &Command{
-	Name:      "help",
-	Aliases:   []string{"h"},
+	Name:      helpName,
+	Aliases:   []string{helpAlias},
 	Usage:     "Shows a list of commands or help for one command",
 	ArgsUsage: "[command]",
 	Action: func(cCtx *Context) error {
@@ -59,6 +64,11 @@ var HelpPrinter helpPrinter = printHelp
 // HelpPrinterCustom is a function that writes the help output. It is used as
 // the default implementation of HelpPrinter, and may be called directly if
 // the ExtraInfo field is set on an App.
+//
+// In the default implementation, if the customFuncs argument contains a
+// "wrapAt" key, which is a function which takes no arguments and returns
+// an int, this int value will be used to produce a "wrap" function used
+// by the default template to wrap long lines.
 var HelpPrinterCustom helpPrinterCustom = printHelpCustom
 
 // VersionPrinter prints the version for the App
@@ -102,7 +112,7 @@ func printCommandSuggestions(commands []*Command, writer io.Writer) {
 		if command.Hidden {
 			continue
 		}
-		if os.Getenv("_CLI_ZSH_AUTOCOMPLETE_HACK") == "1" {
+		if strings.HasSuffix(os.Getenv("SHELL"), "zsh") {
 			for _, name := range command.Names() {
 				_, _ = fmt.Fprintf(writer, "%s:%s\n", name, command.Usage)
 			}
@@ -214,7 +224,13 @@ func ShowCommandHelp(ctx *Context, command string) error {
 	}
 
 	if ctx.App.CommandNotFound == nil {
-		return Exit(fmt.Sprintf("No help topic for '%v'", command), 3)
+		errMsg := fmt.Sprintf("No help topic for '%v'", command)
+		if ctx.App.Suggest {
+			if suggestion := SuggestCommand(ctx.App.Commands, command); suggestion != "" {
+				errMsg += ". " + suggestion
+			}
+		}
+		return Exit(errMsg, 3)
 	}
 
 	ctx.App.CommandNotFound(ctx, command)
@@ -275,12 +291,31 @@ func ShowCommandCompletions(ctx *Context, command string) {
 // The customFuncs map will be combined with a default template.FuncMap to
 // allow using arbitrary functions in template rendering.
 func printHelpCustom(out io.Writer, templ string, data interface{}, customFuncs map[string]interface{}) {
+
+	const maxLineLength = 10000
+
 	funcMap := template.FuncMap{
-		"join":    strings.Join,
-		"indent":  indent,
-		"nindent": nindent,
-		"trim":    strings.TrimSpace,
+		"join":           strings.Join,
+		"subtract":       subtract,
+		"indent":         indent,
+		"nindent":        nindent,
+		"trim":           strings.TrimSpace,
+		"wrap":           func(input string, offset int) string { return wrap(input, offset, maxLineLength) },
+		"offset":         offset,
+		"offsetCommands": offsetCommands,
 	}
+
+	if customFuncs["wrapAt"] != nil {
+		if wa, ok := customFuncs["wrapAt"]; ok {
+			if waf, ok := wa.(func() int); ok {
+				wrapAt := waf()
+				customFuncs["wrap"] = func(input string, offset int) string {
+					return wrap(input, offset, wrapAt)
+				}
+			}
+		}
+	}
+
 	for key, value := range customFuncs {
 		funcMap[key] = value
 	}
@@ -383,6 +418,10 @@ func checkCommandCompletions(c *Context, name string) bool {
 	return true
 }
 
+func subtract(a, b int) int {
+	return a - b
+}
+
 func indent(spaces int, v string) string {
 	pad := strings.Repeat(" ", spaces)
 	return pad + strings.Replace(v, "\n", "\n"+pad, -1)
@@ -390,4 +429,81 @@ func indent(spaces int, v string) string {
 
 func nindent(spaces int, v string) string {
 	return "\n" + indent(spaces, v)
+}
+
+func wrap(input string, offset int, wrapAt int) string {
+	var sb strings.Builder
+
+	lines := strings.Split(input, "\n")
+
+	padding := strings.Repeat(" ", offset)
+
+	for i, line := range lines {
+		if i != 0 {
+			sb.WriteString(padding)
+		}
+
+		sb.WriteString(wrapLine(line, offset, wrapAt, padding))
+
+		if i != len(lines)-1 {
+			sb.WriteString("\n")
+		}
+	}
+
+	return sb.String()
+}
+
+func wrapLine(input string, offset int, wrapAt int, padding string) string {
+	if wrapAt <= offset || len(input) <= wrapAt-offset {
+		return input
+	}
+
+	lineWidth := wrapAt - offset
+	words := strings.Fields(input)
+	if len(words) == 0 {
+		return input
+	}
+
+	wrapped := words[0]
+	spaceLeft := lineWidth - len(wrapped)
+	for _, word := range words[1:] {
+		if len(word)+1 > spaceLeft {
+			wrapped += "\n" + padding + word
+			spaceLeft = lineWidth - len(word)
+		} else {
+			wrapped += " " + word
+			spaceLeft -= 1 + len(word)
+		}
+	}
+
+	return wrapped
+}
+
+func offset(input string, fixed int) int {
+	return len(input) + fixed
+}
+
+// this function tries to find the max width of the names column
+// so say we have the following rows for help
+//
+//	foo1, foo2, foo3  some string here
+//	bar1, b2 some other string here
+//
+// We want to offset the 2nd row usage by some amount so that everything
+// is aligned
+//
+//	foo1, foo2, foo3  some string here
+//	bar1, b2          some other string here
+//
+// to find that offset we find the length of all the rows and use the max
+// to calculate the offset
+func offsetCommands(cmds []*Command, fixed int) int {
+	var max int = 0
+	for _, cmd := range cmds {
+		s := strings.Join(cmd.Names(), ", ")
+		if len(s) > max {
+			max = len(s)
+		}
+	}
+	return max + fixed
 }

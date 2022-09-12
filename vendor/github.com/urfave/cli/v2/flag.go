@@ -7,7 +7,6 @@ import (
 	"io/ioutil"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -130,6 +129,20 @@ type VisibleFlag interface {
 
 	// IsVisible returns true if the flag is not hidden, otherwise false
 	IsVisible() bool
+}
+
+// CategorizableFlag is an interface that allows us to potentially
+// use a flag in a categorized representation.
+type CategorizableFlag interface {
+	VisibleFlag
+
+	GetCategory() string
+}
+
+// Countable is an interface to enable detection of flag values which support
+// repetitive flags
+type Countable interface {
+	Count() int
 }
 
 func flagSet(name string, flags []Flag) (*flag.FlagSet, error) {
@@ -258,7 +271,7 @@ func withEnvHint(envVars []string, str string) string {
 	return str + envText
 }
 
-func flagNames(name string, aliases []string) []string {
+func FlagNames(name string, aliases []string) []string {
 	var ret []string
 
 	for _, part := range append([]string{name}, aliases...) {
@@ -310,53 +323,6 @@ func stringifyFlag(f Flag) string {
 		fmt.Sprintf("%s\t%s", prefixedNames(df.Names(), placeholder), usageWithDefault))
 }
 
-func stringifyIntSliceFlag(f *IntSliceFlag) string {
-	var defaultVals []string
-	if f.Value != nil && len(f.Value.Value()) > 0 {
-		for _, i := range f.Value.Value() {
-			defaultVals = append(defaultVals, strconv.Itoa(i))
-		}
-	}
-
-	return stringifySliceFlag(f.Usage, f.Names(), defaultVals)
-}
-
-func stringifyInt64SliceFlag(f *Int64SliceFlag) string {
-	var defaultVals []string
-	if f.Value != nil && len(f.Value.Value()) > 0 {
-		for _, i := range f.Value.Value() {
-			defaultVals = append(defaultVals, strconv.FormatInt(i, 10))
-		}
-	}
-
-	return stringifySliceFlag(f.Usage, f.Names(), defaultVals)
-}
-
-func stringifyFloat64SliceFlag(f *Float64SliceFlag) string {
-	var defaultVals []string
-
-	if f.Value != nil && len(f.Value.Value()) > 0 {
-		for _, i := range f.Value.Value() {
-			defaultVals = append(defaultVals, strings.TrimRight(strings.TrimRight(fmt.Sprintf("%f", i), "0"), "."))
-		}
-	}
-
-	return stringifySliceFlag(f.Usage, f.Names(), defaultVals)
-}
-
-func stringifyStringSliceFlag(f *StringSliceFlag) string {
-	var defaultVals []string
-	if f.Value != nil && len(f.Value.Value()) > 0 {
-		for _, s := range f.Value.Value() {
-			if len(s) > 0 {
-				defaultVals = append(defaultVals, strconv.Quote(s))
-			}
-		}
-	}
-
-	return stringifySliceFlag(f.Usage, f.Names(), defaultVals)
-}
-
 func stringifySliceFlag(usage string, names, defaultVals []string) string {
 	placeholder, usage := unquoteUsage(usage)
 	if placeholder == "" {
@@ -369,11 +335,8 @@ func stringifySliceFlag(usage string, names, defaultVals []string) string {
 	}
 
 	usageWithDefault := strings.TrimSpace(fmt.Sprintf("%s%s", usage, defaultVal))
-	multiInputString := "(accepts multiple inputs)"
-	if usageWithDefault != "" {
-		multiInputString = "\t" + multiInputString
-	}
-	return fmt.Sprintf("%s\t%s%s", prefixedNames(names, placeholder), usageWithDefault, multiInputString)
+	pn := prefixedNames(names, placeholder)
+	return fmt.Sprintf("%s [ %s ]\t%s", pn, pn, usageWithDefault)
 }
 
 func hasFlag(flags []Flag, fl Flag) bool {
@@ -386,21 +349,24 @@ func hasFlag(flags []Flag, fl Flag) bool {
 	return false
 }
 
-func flagFromEnvOrFile(envVars []string, filePath string) (val string, ok bool) {
+// Return the first value from a list of environment variables and files
+// (which may or may not exist), a description of where the value was found,
+// and a boolean which is true if a value was found.
+func flagFromEnvOrFile(envVars []string, filePath string) (value string, fromWhere string, found bool) {
 	for _, envVar := range envVars {
 		envVar = strings.TrimSpace(envVar)
-		if val, ok := syscall.Getenv(envVar); ok {
-			return val, true
+		if value, found := syscall.Getenv(envVar); found {
+			return value, fmt.Sprintf("environment variable %q", envVar), true
 		}
 	}
 	for _, fileVar := range strings.Split(filePath, ",") {
 		if fileVar != "" {
 			if data, err := ioutil.ReadFile(fileVar); err == nil {
-				return string(data), true
+				return string(data), fmt.Sprintf("file %q", filePath), true
 			}
 		}
 	}
-	return "", false
+	return "", "", false
 }
 
 func flagSplitMultiValues(val string) []string {
